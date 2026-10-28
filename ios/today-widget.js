@@ -2,9 +2,10 @@
 //
 // - 今日が期限（期限切れ・持ち越し分も含む）で未完了のタスクを、重要度の高い順に表示する
 // - ロック画面: 時計の下（長方形）・時計の上（1行）・丸形 に対応。ホーム画面のウィジェットにも使える
-// - タップすると Notion の Todo を開く
+// - ウィジェットをタップすると、今日のTodoのチェックリストが開き、タップで完了にできる
+//   （Notion に保存し、PC の todo-sync が次の同期で Google カレンダーに反映する）
 //
-// 設定: Scriptable アプリでこのスクリプトを1回実行し、Notion の「読み取り専用」のトークンと
+// 設定: Scriptable アプリでこのスクリプトを1回実行し、Notion のトークン（権限は「読み取り」と「更新」だけ）と
 //       データベースの ID を入力する（キーチェーンに保存され、スクリプトには書かない）
 
 const KEY_TOKEN = "todo-sync.notionToken";
@@ -13,16 +14,20 @@ const NOTION_VERSION = "2022-06-28";
 const REFRESH_MINUTES = 15; // 更新を頼む間隔（実際にいつ更新するかは iOS が決める）
 
 // Notion のプロパティ名（データベース側と完全に一致させる）
-const PROP = { title: "タイトル", importance: "重要度", due: "期限", done: "完了", original: "元の期限" };
+const PROP = { title: "タイトル", importance: "重要度", due: "期限", done: "完了", doneAt: "完了日時", original: "元の期限" };
 const ORDER = { "高": 0, "中": 1, "低": 2 };
 const COLORS = { "高": "#cf222e", "中": "#bf8700", "低": "#1a7f37" };
 
 // ---------- 設定 ----------
 
+function configured() {
+  return Keychain.contains(KEY_TOKEN) && Keychain.contains(KEY_DB);
+}
+
 async function setup() {
   const alert = new Alert();
   alert.title = "todo-sync の設定";
-  alert.message = "Notion の読み取り専用トークン（ntn_...）と、Todo データベースの ID（32文字）を入力してください。";
+  alert.message = "Notion のトークン（ntn_...、権限は「読み取り」と「更新」）と、Todo データベースの ID（32文字）を入力してください。";
   alert.addSecureTextField("トークン（ntn_...）", Keychain.contains(KEY_TOKEN) ? Keychain.get(KEY_TOKEN) : "");
   alert.addTextField("データベースの ID", Keychain.contains(KEY_DB) ? Keychain.get(KEY_DB) : "");
   alert.addAction("保存");
@@ -49,30 +54,59 @@ async function message(title, text) {
   await alert.presentAlert();
 }
 
-// ---------- Notion から今日のタスクを取る ----------
+// ---------- Notion ----------
+
+async function notion(method, path, body) {
+  const req = new Request(`https://api.notion.com/v1${path}`);
+  req.method = method;
+  req.headers = {
+    Authorization: `Bearer ${Keychain.get(KEY_TOKEN)}`,
+    "Notion-Version": NOTION_VERSION,
+    "Content-Type": "application/json",
+  };
+  if (body) req.body = JSON.stringify(body);
+  const data = await req.loadJSON();
+  const status = req.response.statusCode;
+  if (status !== 200) {
+    const hint = {
+      401: "トークンが正しくありません",
+      403: "このトークンには「コンテンツを更新」の権限がありません",
+      404: "DBが見つかりません（コネクトを追加したか確認）",
+    }[status];
+    throw new Error(hint || data.message || `HTTP ${status}`);
+  }
+  return data;
+}
 
 function localDate(d = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+function nowIso() {
+  // 端末のタイムゾーン付き（例: 2026-10-29T08:30:00+09:00）
+  const d = new Date();
+  const off = -d.getTimezoneOffset();
+  const pad = (n) => String(Math.floor(Math.abs(n))).padStart(2, "0");
+  const tz = `${off >= 0 ? "+" : "-"}${pad(off / 60)}:${pad(off % 60)}`;
+  return `${localDate(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${tz}`;
+}
+
 function plain(items) {
   return (items || []).map((t) => t.plain_text || "").join("");
 }
 
-async function fetchToday(token, db) {
+function daysBetween(from, to) {
+  return Math.round((new Date(`${to}T00:00:00`) - new Date(`${from}T00:00:00`)) / 86400000);
+}
+
+async function fetchToday() {
+  const db = Keychain.get(KEY_DB);
   const today = localDate();
   const tasks = [];
   let cursor = undefined;
   do {
-    const req = new Request(`https://api.notion.com/v1/databases/${db}/query`);
-    req.method = "POST";
-    req.headers = {
-      Authorization: `Bearer ${token}`,
-      "Notion-Version": NOTION_VERSION,
-      "Content-Type": "application/json",
-    };
-    req.body = JSON.stringify({
+    const data = await notion("POST", `/databases/${db}/query`, {
       filter: {
         and: [
           { property: PROP.done, checkbox: { equals: false } },
@@ -82,21 +116,17 @@ async function fetchToday(token, db) {
       page_size: 100,
       ...(cursor ? { start_cursor: cursor } : {}),
     });
-    const data = await req.loadJSON();
-    const status = req.response.statusCode;
-    if (status !== 200) {
-      const hint = { 401: "トークンが正しくありません", 404: "DBが見つかりません（コネクトを追加したか確認）" }[status];
-      throw new Error(hint || data.message || `HTTP ${status}`);
-    }
     for (const page of data.results) {
       const p = page.properties;
       const due = p[PROP.due] && p[PROP.due].date ? p[PROP.due].date.start.slice(0, 10) : today;
       const original = p[PROP.original] && p[PROP.original].date ? p[PROP.original].date.start.slice(0, 10) : null;
       tasks.push({
+        id: page.id,
         title: plain(p[PROP.title] && p[PROP.title].title) || "（無題）",
         importance: (p[PROP.importance] && p[PROP.importance].select && p[PROP.importance].select.name) || "中",
         // 期限を過ぎてからの日数（持ち越し中なら元の期限から数える）
         late: daysBetween(original || due, today),
+        done: false,
       });
     }
     cursor = data.has_more ? data.next_cursor : undefined;
@@ -106,8 +136,82 @@ async function fetchToday(token, db) {
   return tasks.sort((a, b) => (ORDER[a.importance] ?? 1) - (ORDER[b.importance] ?? 1) || b.late - a.late);
 }
 
-function daysBetween(from, to) {
-  return Math.round((new Date(`${to}T00:00:00`) - new Date(`${from}T00:00:00`)) / 86400000);
+async function setDone(task, done) {
+  await notion("PATCH", `/pages/${task.id}`, {
+    properties: {
+      [PROP.done]: { checkbox: done },
+      [PROP.doneAt]: { date: done ? { start: nowIso() } : null },
+    },
+  });
+}
+
+// ---------- チェックリスト（ウィジェットをタップしたときに開く） ----------
+
+async function showChecklist() {
+  let tasks;
+  try {
+    tasks = await fetchToday();
+  } catch (e) {
+    await message("Todoを読み込めません", e.message);
+    return;
+  }
+  const table = new UITable();
+  table.showSeparators = true;
+  const saving = new Set(); // 保存中の通信。閉じたあとも、終わるまで待ってから終了する
+
+  const toggle = (t) => {
+    if (t.saving) return;
+    t.done = !t.done; // 画面にはすぐ反映し、保存は裏で行う
+    t.saving = true;
+    render();
+    const job = setDone(t, t.done)
+      .catch(async (e) => {
+        t.done = !t.done;
+        await message("保存できませんでした", `「${t.title}」: ${e.message}`);
+      })
+      .finally(() => {
+        t.saving = false;
+        saving.delete(job);
+        render();
+      });
+    saving.add(job);
+  };
+
+  const render = () => {
+    table.removeAllRows();
+    const head = new UITableRow();
+    head.isHeader = true;
+    head.height = 60;
+    head.addText(`今日のTodo（残り ${tasks.filter((t) => !t.done).length}件）`, "タップで完了・もう一度タップで元に戻す");
+    table.addRow(head);
+
+    if (!tasks.length) {
+      const row = new UITableRow();
+      row.addText("今日のタスクはありません");
+      table.addRow(row);
+    }
+    for (const t of tasks) {
+      const row = new UITableRow();
+      row.height = 56;
+      row.dismissOnSelect = false;
+      const sub = t.saving ? "保存しています…" : t.done ? "完了しました" : t.late > 0 ? `${t.late}日遅れ` : "今日まで";
+      const cell = row.addText(`${t.done ? "☑" : "☐"}  ${t.importance}  ${t.title}`, sub);
+      if (t.done) cell.titleColor = Color.gray();
+      if (!t.done && t.late > 0) cell.subtitleColor = new Color(COLORS["高"]);
+      row.onSelect = () => toggle(t);
+      table.addRow(row);
+    }
+
+    const open = new UITableRow();
+    open.addText("Notionで開く");
+    open.onSelect = () => Safari.open(`https://www.notion.so/${Keychain.get(KEY_DB)}`);
+    table.addRow(open);
+    table.reload();
+  };
+
+  render();
+  await table.present();
+  await Promise.all([...saving]);
 }
 
 // ---------- ウィジェット ----------
@@ -196,15 +300,15 @@ function buildError(widget, family, error) {
 async function buildWidget(family) {
   const widget = new ListWidget();
   widget.refreshAfterDate = new Date(Date.now() + REFRESH_MINUTES * 60 * 1000);
-  if (!Keychain.contains(KEY_TOKEN) || !Keychain.contains(KEY_DB)) {
+  // タップすると、このスクリプトをチェックリストの画面で開く
+  widget.url = `scriptable:///run/${encodeURIComponent(Script.name())}?action=checklist`;
+  if (!configured()) {
     widget.addText(family === "accessoryInline" ? "Todo: 未設定" : "Scriptableでこのスクリプトを実行して設定してください").font =
       Font.systemFont(11);
     return widget;
   }
-  const db = Keychain.get(KEY_DB);
-  widget.url = `https://www.notion.so/${db}`;
   try {
-    const tasks = await fetchToday(Keychain.get(KEY_TOKEN), db);
+    const tasks = await fetchToday();
     if (family === "accessoryRectangular") buildRectangular(widget, tasks);
     else if (family === "accessoryInline") buildInline(widget, tasks);
     else if (family === "accessoryCircular") buildCircular(widget, tasks);
@@ -219,23 +323,23 @@ async function buildWidget(family) {
 
 if (config.runsInWidget || config.runsInAccessoryWidget) {
   Script.setWidget(await buildWidget(config.widgetFamily));
+} else if (!configured()) {
+  // 初回: 設定してからチェックリストを開く
+  if (await setup()) await showChecklist();
+} else if (args.queryParameters && args.queryParameters.action === "checklist") {
+  // ウィジェットをタップして開いたとき
+  await showChecklist();
 } else {
-  // アプリ内で実行したとき: 未設定なら設定、設定済みなら設定し直すかプレビューを選ぶ
-  let ready = Keychain.contains(KEY_TOKEN) && Keychain.contains(KEY_DB);
-  if (!ready) {
-    ready = await setup();
-  } else {
-    const menu = new Alert();
-    menu.title = "todo-sync";
-    menu.addAction("プレビュー");
-    menu.addAction("トークン・DBを設定し直す");
-    menu.addCancelAction("閉じる");
-    const choice = await menu.presentAlert();
-    if (choice === 1) ready = await setup();
-    else if (choice === -1) ready = false;
-  }
-  if (ready) {
-    await (await buildWidget("medium")).presentMedium();
-  }
+  // アプリ内で実行したとき
+  const menu = new Alert();
+  menu.title = "todo-sync";
+  menu.addAction("今日のTodo（チェックリスト）");
+  menu.addAction("ウィジェットのプレビュー");
+  menu.addAction("トークン・DBを設定し直す");
+  menu.addCancelAction("閉じる");
+  const choice = await menu.presentAlert();
+  if (choice === 0) await showChecklist();
+  else if (choice === 1) await (await buildWidget("medium")).presentMedium();
+  else if (choice === 2 && (await setup())) await showChecklist();
 }
 Script.complete();
