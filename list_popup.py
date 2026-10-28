@@ -35,6 +35,8 @@ def due_columns(t: NotionTask, today: date) -> tuple[str, str, str]:
     if t.done:
         return text, "", "sub"
     days = (d - today).days
+    if t.original_due and days <= 0:  # 期限を過ぎて持ち越している
+        return text, f"{(today - date.fromisoformat(t.original_due)).days}日持ち越し", "overdue"
     if days < 0:
         return text, f"{-days}日超過", "overdue"
     if days == 0:
@@ -45,7 +47,8 @@ def due_columns(t: NotionTask, today: date) -> tuple[str, str, str]:
 
 
 def sort_key(t: NotionTask):
-    return (t.due is None, t.due or "", t.title)
+    # 期限順。同じ日なら、持ち越しが長いものを先に
+    return (t.due is None, t.due or "", t.original_due or "9999-12-31", t.title)
 
 
 class ListPopup:

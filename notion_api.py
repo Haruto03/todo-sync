@@ -57,6 +57,7 @@ FIELD_PROPS = {
     "source": (config.PROP_SOURCE, "rich_text"),
     "gtask_id": (config.PROP_GTASK_ID, "rich_text"),
     "snapshot": (config.PROP_SNAPSHOT, "rich_text"),
+    "original_due": (config.PROP_ORIGINAL_DUE, "date"),
 }
 
 
@@ -100,6 +101,7 @@ class NotionTask:
     gtask_id: str
     snapshot: dict | None  # 前回同期したときの値
     last_edited: datetime
+    original_due: str | None = None  # 持ち越し中なら最初の期限 "YYYY-MM-DD"
 
 
 def parse_date(prop: dict) -> str | None:
@@ -111,6 +113,7 @@ def from_page(page: dict) -> NotionTask:
     p = page["properties"]
     select = p.get(config.PROP_IMPORTANCE, {}).get("select")
     due = parse_date(p.get(config.PROP_DUE, {}))
+    original_due = parse_date(p.get(config.PROP_ORIGINAL_DUE, {}))
     try:
         snapshot = json.loads(plain(p.get(config.PROP_SNAPSHOT, {}).get("rich_text", [])) or "null")
     except json.JSONDecodeError:
@@ -126,6 +129,7 @@ def from_page(page: dict) -> NotionTask:
         gtask_id=plain(p.get(config.PROP_GTASK_ID, {}).get("rich_text", [])).strip(),
         snapshot=snapshot if isinstance(snapshot, dict) else None,
         last_edited=datetime.fromisoformat(page["last_edited_time"]),
+        original_due=original_due[:10] if original_due else None,
     )
 
 
@@ -171,6 +175,17 @@ def is_gone(page_id: str) -> bool:
             return True
         raise
     return bool(page.get("archived") or page.get("in_trash"))
+
+
+def add_missing_properties() -> list[str]:
+    """データベースに足りないプロパティがあれば追加して、追加した名前を返す（あとから増えた項目用）。"""
+    db = request("GET", f"/databases/{config.NOTION_DATABASE_ID}")
+    missing = {name: kind for name, kind in config.EXPECTED_PROPERTIES.items()
+               if name not in db.get("properties", {}) and kind in ("date", "rich_text", "checkbox")}
+    if missing:
+        request("PATCH", f"/databases/{config.NOTION_DATABASE_ID}",
+                {"properties": {name: {kind: {}} for name, kind in missing.items()}})
+    return list(missing)
 
 
 def page_link(page_id: str) -> str:

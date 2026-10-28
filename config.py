@@ -37,6 +37,7 @@ PROP_CREATED = "登録日時"
 PROP_SOURCE = "取得元"
 PROP_GTASK_ID = "GTask ID"
 PROP_SNAPSHOT = "同期スナップショット"
+PROP_ORIGINAL_DUE = "元の期限"  # 期限を過ぎて持ち越したときの、最初の期限
 
 # プロパティ名 → Notion APIでの種類
 EXPECTED_PROPERTIES = {
@@ -49,6 +50,7 @@ EXPECTED_PROPERTIES = {
     PROP_SOURCE: "rich_text",
     PROP_GTASK_ID: "rich_text",
     PROP_SNAPSHOT: "rich_text",
+    PROP_ORIGINAL_DUE: "date",
 }
 
 # 重要度 → Google ToDoリストのタイトル先頭に付ける印

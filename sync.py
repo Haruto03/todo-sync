@@ -4,19 +4,22 @@
 - 片方だけ変わっていたら、その値をもう片方に反映する
 - 両方変わっていたら、更新時刻が新しい方を採用する
 削除は、Googleで消したらNotionではゴミ箱へ、Notionでゴミ箱に入れたらGoogleからも削除する。
+期限を過ぎて未完了のタスクは、期限を今日に持ち越す（最初の期限はNotionの「元の期限」とGoogleのメモ欄に残す）。
 
 実行: .venv\\Scripts\\python.exe sync.py            1回だけ同期する
       .venv\\Scripts\\python.exe sync.py --dry-run  何をするかを表示するだけ（書き込まない）
 """
 
 import argparse
+import re
 import sys
 import threading
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable
 
 import config
+import due
 import gtasks_api
 import notion_api
 from gtasks_api import GoogleTask
@@ -32,8 +35,25 @@ log: Callable[[str], None] = print
 _lock = threading.Lock()  # 定期同期と「登録直後の同期」が同時に走らないようにする
 
 
+CARRY_LINE_RE = re.compile(r"^持ち越し中（元の期限: [^）\n]*）\n?", re.MULTILINE)
+
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def today() -> date:
+    """今日の日付（日付が変わったときの動きをテストで確かめられるように関数にしている）"""
+    return date.today()
+
+
+def notes_with_carry(notes: str, original_due: str | None) -> str:
+    """Googleのメモ欄の「持ち越し中」の行を、今の状態に合わせて書き換える（ほかの行はそのまま）。"""
+    notes = CARRY_LINE_RE.sub("", notes).strip("\n")
+    if not original_due:
+        return notes
+    line = f"持ち越し中（元の期限: {due.format_due(date.fromisoformat(original_due), today())}）"
+    return f"{line}\n{notes}" if notes else line
 
 
 def notion_values(p: NotionTask) -> dict:
@@ -82,6 +102,7 @@ class Syncer:
     def run(self) -> Counter:
         name = config.GOOGLE_TASKLIST_NAME
         pages = notion_api.query_all()
+        self.carry_over(pages)
         self.list_id = self.google.find_list(name)
         list_is_new = self.list_id is None
         if list_is_new and self.act("リスト作成", f"Google ToDoリストに「{name}」を作成"):
@@ -128,6 +149,28 @@ class Syncer:
                 self.google.delete(self.list_id, t.task_id)
         return self.counts
 
+    # --- 期限を過ぎた未完了タスクの持ち越し ---
+
+    def carry_over(self, pages: list[NotionTask]) -> None:
+        """期限を過ぎて未完了のタスクは、期限を今日に動かす（最初の期限は「元の期限」に残す）。
+        期限を先の日付に変え直したか、期限なしにしたら、持ち越しは終わりとして「元の期限」を消す。
+        Notionの値を書き換えるだけで、Googleへは通常の同期で反映される。"""
+        t = today().isoformat()
+        for p in pages:
+            if not p.done and p.due and p.due < t:
+                fields = {"due": t, "original_due": p.original_due or p.due}
+                message = f"期限を今日に持ち越し「{p.title}」（元の期限: {fields['original_due']}）"
+            elif p.original_due and (not p.due or p.due > t):
+                fields = {"original_due": None}
+                message = f"持ち越しを終了「{p.title}」（期限が変更されたため）"
+            else:
+                continue
+            if self.act("持ち越し", message):
+                notion_api.update(p.page_id, fields)
+            # 更新時刻（last_edited）はそのままにする。スマホで期限を変えていた場合は、そちらを優先するため
+            p.due = fields.get("due", p.due)
+            p.original_due = fields["original_due"]
+
     # --- Notion → Google（新規） ---
 
     def push_new(self, p: NotionTask) -> None:
@@ -135,7 +178,7 @@ class Syncer:
         if not self.act("Google追加", f"Googleに追加「{p.title}」"):
             return
         body = gtasks_api.to_body(**values)
-        body["notes"] = f"Notionで開く: {notion_api.page_link(p.page_id)}"
+        body["notes"] = notes_with_carry(f"Notionで開く: {notion_api.page_link(p.page_id)}", p.original_due)
         t = self.google.insert(self.list_id, body)
 
         fields = {"gtask_id": t.task_id, "snapshot": values, **done_at_fields(p, values["done"])}
@@ -190,9 +233,16 @@ class Syncer:
             patch["status"] = body["status"]
             if "completed" in body:
                 patch["completed"] = body["completed"]
+        # 持ち越し中（未完了で、期限が今日まで）なら、メモ欄に元の期限を書く
+        carrying = p.original_due if not merged["done"] and merged["due"] and merged["due"] <= today().isoformat() else None
+        notes = notes_with_carry(t.notes, carrying)
+        if notes != t.notes:
+            patch["notes"] = notes
         if patch:
-            changed = [f for f in FIELDS if merged[f] != g[f]]
-            if not self.act("Google更新", f"Googleを更新「{merged['title']}」: {labels(changed) or '重要度の印'}"):
+            names = [FIELD_LABELS[f] for f in FIELDS if merged[f] != g[f]]
+            if "notes" in patch:
+                names.append("持ち越しのメモ")
+            if not self.act("Google更新", f"Googleを更新「{merged['title']}」: {'・'.join(names) or '重要度の印'}"):
                 return
             t = self.google.patch(self.list_id, t.task_id, patch)
 

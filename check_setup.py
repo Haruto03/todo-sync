@@ -37,6 +37,14 @@ def check_notion() -> bool:
     title = "".join(t.get("plain_text", "") for t in db.get("title", [])) or "(無題)"
     print(f"  {OK} データベース「{title}」に接続できました")
 
+    # あとから増えたプロパティ（日付・テキストなど）は、ここで自動で追加する
+    import notion_api
+
+    added = notion_api.add_missing_properties()
+    if added:
+        print(f"  {OK} 足りなかったプロパティを追加しました: {', '.join(added)}")
+        db = notion_api.request("GET", f"/databases/{config.NOTION_DATABASE_ID}")
+
     props = db.get("properties", {})
     all_ok = True
     for name, expected in config.EXPECTED_PROPERTIES.items():
